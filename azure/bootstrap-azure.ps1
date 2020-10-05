@@ -2,7 +2,9 @@ param (
     $OctopusURL,
     $OctopusApiKey,
     $OctopusSpaceName,
-    $AzureTenantId
+    $AzureTenantId,
+    $AzureSubscriptionName,
+    $AzureServicePrincipalName
 )
 
 $ErrorActionPreference = "Stop"
@@ -113,13 +115,12 @@ function Get-OctopusItemByName
 Write-OctopusVerbose "This script will do the following:"
 Write-OctopusVerbose "    1) In Azure: create an Azure Service Principal and associate it with your desired subscription as a contributor"
 Write-OctopusVerbose "    2) In Octopus Deploy: create an Azure Account using the credentials created in step 1"
-Write-OctopusVerbose "    3) Optional in Azure: create a worker running in a container and register it with Octopus Deploy"
 
-Write-OctopusVerbose "For this to work you will need to have the following installed.  If it is not installed, then this script will it install it for you."
+Write-OctopusVerbose "For this to work you will need to have the following installed.  If it is not installed, then this script will it install it for you from the PowerShell Gallery."
 Write-OctopusVerbose "    1)  Azure Az Powershell Modules"
 
 $answer = Read-Host -Prompt "Do you wish to continue? y/n"
-if ($answer -ne "y")
+if ($answer.ToLower() -ne "y")
 {
     Write-OctopusWarning "You have chosen not to continue.  Stopping script."
     Exit
@@ -197,6 +198,16 @@ if ($null -ne $existingAccount)
     }    
 }
 
+if ($OctopusAndAzureServicePrincipalAlreadyExist -eq $true)
+{
+    $overwriteExisting = Read-Host -Prompt "Octopus Deploy already has a working connection with Azure.  Do you wish to continue?  This will create a new password for the service principal account in Azure and update the account in Octopus Deploy.  y/n"
+    If ($overwriteExisting.ToLower() -ne "y")
+    {
+        Write-OctopusSuccess "Octopus Deploy already has a working connection and you elected to leave as is, stopping script."
+        exit
+    }
+}
+
 $AzureTenantId = Get-ParameterValue -originalParameterValue $AzureTenantId -parameterName "the ID (GUID) of the Azure tenant you wish to connect to.  See https://microsoft.github.io/AzureTipsAndTricks/blog/tip153.html on how to get that id."
 $AzureSubscriptionName = Get-ParameterValue -originalParameterValue $AzureSubscriptionName -parameterName "the name of the subscription you wish to connect Octopus Deploy to"
 $AzureServicePrincipalName = Get-ParameterValue -originalParameterValue $AzureServicePrincipalName -parameterName "the name of the service principal you wish to create in Azure"
@@ -204,81 +215,71 @@ $AzureServicePrincipalName = Get-ParameterValue -originalParameterValue $AzureSe
 Write-OctopusVerbose "Logging into Azure"
 Connect-AzAccount -Tenant $AzureTenantId -Subscription $AzureSubscriptionName
 
-if ($OctopusAndAzureServicePrincipalAlreadyExist -eq $false)
+Write-Host "The service principal account or the Octopus Account do not exist or they haven't been hooked up.  Configuring Azure and Octopus Deploy."
+$AzureServicePrincipalEndDays = Get-ParameterValue -originalParameterValue $null -parameterName "the number of days you want the service principal password to be active"
+
+$password = "$(New-Guid)$(New-Guid)" -replace "-", ""
+$securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+
+$endDate = (Get-Date).AddDays($AzureServicePrincipalEndDays)
+
+$azureSubscription = Get-AzSubscription -SubscriptionName $AzureSubscriptionName
+$azureSubscription | Format-Table
+
+$ExistingApplication = Get-AzADApplication -DisplayName "$AzureServicePrincipalName"
+$ExistingApplication | Format-Table
+
+if ($null -eq $ExistingApplication)
 {
-    Write-Host "The service principal account or the Octopus Account do not exist or they haven't been hooked up.  Configuring Azure and Octopus Deploy."
-    $AzureServicePrincipalEndDays = Get-ParameterValue -originalParameterValue $null -parameterName "the number of days you want the service principal password to be active"
+    Write-OctopusVerbose "The Azure Active Directory Application does not exist, creating Azure Active Directory application"
+    $azureAdApplication = New-AzADApplication -DisplayName "$AzureServicePrincipalName" -HomePage "http://octopus.com" -IdentifierUris "http://octopus.com" -Password $securePassword -EndDate $endDate
+    $azureAdApplication | Format-Table
 
-    $password = "$(New-Guid)$(New-Guid)" -replace "-", ""
-    $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+    Write-OctopusVerbose "Creating Azure Active Directory service principal"
+    $servicePrincipal = New-AzADServicePrincipal -ApplicationId $azureAdApplication.ApplicationId
+    $servicePrincipal | Format-Table
 
-    $endDate = (Get-Date).AddDays($AzureServicePrincipalEndDays)
-
-    $azureSubscription = Get-AzSubscription -SubscriptionName $AzureSubscriptionName
-    $azureSubscription | Format-Table
-
-    $ExistingApplication = Get-AzADApplication -DisplayName "$AzureServicePrincipalName"
-    $ExistingApplication | Format-Table
-
-    if ($null -eq $ExistingApplication)
-    {
-        Write-OctopusVerbose "The Azure Active Directory Application does not exist, creating Azure Active Directory application"
-        $azureAdApplication = New-AzADApplication -DisplayName "$AzureServicePrincipalName" -HomePage "http://octopus.com" -IdentifierUris "http://octopus.com" -Password $securePassword -EndDate $endDate
-        $azureAdApplication | Format-Table
-
-        Write-OctopusVerbose "Creating Azure Active Directory service principal"
-        $servicePrincipal = New-AzADServicePrincipal -ApplicationId $azureAdApplication.ApplicationId
-        $servicePrincipal | Format-Table
-
-        Write-OctopusSuccess "Azure Service Principal successfully created."
-    }
-    else 
-    {
-        Write-OctopusVerbose "The azue service principal $AzureServicePrincipalName already exists, creating a new password for Octopus Deploy to use."        
-        New-AzADAppCredential -DisplayName "$AzureServicePrincipalName" -Password $securePassword -EndDate $endDate     
-        Write-OctopusSuccess "Azure Service Principal successfully password successfully created."
-    }
-
-    if ($null -eq $existingAccount)
-    {
-        Write-OctopusVerbose "The account $accountName does not exist, creating it"
-        $jsonPayload = @{
-            AccountType = "AzureServicePrincipal"
-            AzureEnvironment = ""
-            SubscriptionNumber = $azureSubscription.Id
-            Password = @{
-                HasValue = $true
-                NewValue = $password
-            }
-            TenantId = $AzureTenantId
-            ClientId = $azureAdApplication.ApplicationId
-            ActiveDirectoryEndpointBaseUri = ""
-            ResourceManagementEndpointBaseUri = ""
-            Name = $accountName
-            Description = "Account created by the bootstrap script"
-            TenantedDeploymentParticipation = "Untenanted"
-            TenantTags = @()
-            TenantIds = @()
-            EnvironmentIds = @()
-        }
-
-        Write-OctopusVerbose "Adding the just created Azure Service Principal to Octopus Deploy"
-        Invoke-OctopusApi -EndPoint "accounts" -item $jsonPayload -method "POST" -SpaceId $spaceInfo.Id -apiKey $OctopusApiKey -OctopusURL $OctopusURL
-
-        Write-OctopusSuccess "Successfully added the Azure Service Principal account to Octopus Deploy"
-    }
-    else 
-    {
-        $existingAccount.Password.HasValue = $true    
-        $existingAccount.Password.NewValue = $password
-
-        Invoke-OctopusApi -EndPoint "accounts/$($existingAccount.Id)" -item $existingAccount -method "PUT" -SpaceId $spaceInfo.Id -apiKey $OctopusApiKey -OctopusURL $OctopusUrl
-    }
+    Write-OctopusSuccess "Azure Service Principal successfully created."
+}
+else 
+{
+    Write-OctopusVerbose "The azue service principal $AzureServicePrincipalName already exists, creating a new password for Octopus Deploy to use."        
+    New-AzADAppCredential -DisplayName "$AzureServicePrincipalName" -Password $securePassword -EndDate $endDate     
+    Write-OctopusSuccess "Azure Service Principal successfully password successfully created."
 }
 
-$createWorker = Read-Host "Would you like to create a Octopus Deploy worker in Azure?  It will spin up a Linux based container in Azure Container Service.  This will allow you to run Octopus Deployments to Azure PaaS services without having to open them up to Octopus Cloud.  y/n"
-if ($createWorker -eq "n")
+if ($null -eq $existingAccount)
 {
-    Write-OctopusWarning "You have elected to not create a worker, stopping script."
-    Exit
+    Write-OctopusVerbose "The account $accountName does not exist, creating it"
+    $jsonPayload = @{
+        AccountType = "AzureServicePrincipal"
+        AzureEnvironment = ""
+        SubscriptionNumber = $azureSubscription.Id
+        Password = @{
+            HasValue = $true
+            NewValue = $password
+        }
+        TenantId = $AzureTenantId
+        ClientId = $azureAdApplication.ApplicationId
+        ActiveDirectoryEndpointBaseUri = ""
+        ResourceManagementEndpointBaseUri = ""
+        Name = $accountName
+        Description = "Account created by the bootstrap script"
+        TenantedDeploymentParticipation = "Untenanted"
+        TenantTags = @()
+        TenantIds = @()
+        EnvironmentIds = @()
+    }
+
+    Write-OctopusVerbose "Adding the just created Azure Service Principal to Octopus Deploy"
+    Invoke-OctopusApi -EndPoint "accounts" -item $jsonPayload -method "POST" -SpaceId $spaceInfo.Id -apiKey $OctopusApiKey -OctopusURL $OctopusURL
+
+    Write-OctopusSuccess "Successfully added the Azure Service Principal account to Octopus Deploy"
+}
+else 
+{
+    $existingAccount.Password.HasValue = $true    
+    $existingAccount.Password.NewValue = $password
+
+    Invoke-OctopusApi -EndPoint "accounts/$($existingAccount.Id)" -item $existingAccount -method "PUT" -SpaceId $spaceInfo.Id -apiKey $OctopusApiKey -OctopusURL $OctopusUrl
 }
