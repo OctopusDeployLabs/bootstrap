@@ -126,7 +126,7 @@ function Import-AzurePowerShellModules
         Install-Module -Name Az -AllowClobber -Scope CurrentUser
     }
 
-    Write-OctopusVerbose "Loading the Azure Az Module"
+    Write-OctopusVerbose "Loading the Azure Az Module.  This may cause the screen to freeze while loading the module."
     Import-Module -Name Az
 }
 
@@ -387,3 +387,9 @@ else
     Invoke-OctopusApi -EndPoint "accounts/$($existingAccount.Id)" -item $existingAccount -method "PUT" -SpaceId $spaceInfo.Id -apiKey $OctopusApiKey -OctopusURL $OctopusUrl
     Write-OctopusSuccess "Successfully updated Azure Service Principal account in Octopus Deploy"
 }
+
+Write-OctopusSuccess "Important information to know for future usage:"
+Write-OctopusVerbose "    1) The Azure Tenant Id is: $AzureTenantId"
+Write-OctopusVerbose "    2) The Azure Subscription Id: $($azureSubscription.SubscriptionId)"  
+Write-OctopusVerbose "    3) The Azure Application Id: $AzureApplicationId"
+Write-OctopusVerbose "    4) The new password is: $password - this is the only time you'll see this password, please store it in a safe location."
