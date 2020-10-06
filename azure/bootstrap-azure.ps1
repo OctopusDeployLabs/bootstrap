@@ -215,7 +215,7 @@ function New-OctopusIdList
         return $IdList
     }
 
-    $itemFilter = Read-Host -prompt "$itemName records found.  Please enter a comman-separated list of $itemName you'd like to associate the account to.  If left blank the account can be used for all $itemName."        
+    $itemFilter = Read-Host -prompt "$itemName records found.  Please enter a comma-separated list of $itemName you'd like to associate the account to.  If left blank the account can be used for all $itemName."        
     
     if ([string]::IsNullOrWhiteSpace($itemFilter) -eq $true)
     {
@@ -320,7 +320,7 @@ $ExistingApplication | Format-Table
 if ($null -eq $ExistingApplication)
 {
     Write-OctopusVerbose "The Azure Active Directory Application does not exist, creating Azure Active Directory application"
-    $azureAdApplication = New-AzADApplication -DisplayName "$AzureServicePrincipalName" -HomePage "http://octopus.com" -IdentifierUris "http://octopus.com" -Password $securePassword -EndDate $endDate
+    $azureAdApplication = New-AzADApplication -DisplayName "$AzureServicePrincipalName" -HomePage "http://octopus.com" -IdentifierUris "http://octopus.com/$($AzureServicePrincipalName)" -Password $securePassword -EndDate $endDate
     $azureAdApplication | Format-Table
 
     Write-OctopusVerbose "Creating Azure Active Directory service principal"
