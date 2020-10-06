@@ -3,9 +3,12 @@ param (
     $OctopusApiKey,
     $OctopusSpaceName,
     $OctopusAccountName,
+    $OctopusEnvironmentList,
+    $OctopusTenantList,
     $AzureTenantId,
     $AzureSubscriptionName,
-    $AzureServicePrincipalName
+    $AzureServicePrincipalName,
+    $AzureServicePrincipalPasswordEndDays
 )
 
 $ErrorActionPreference = "Stop"
@@ -203,7 +206,8 @@ function New-OctopusIdList
         $OctopusApiKey,
         $spaceInfo,
         $endPoint,
-        $itemName
+        $itemName,
+        $itemParameter
     )
 
     Write-OctopusVerbose "Checking to see if Octopus Deploy instance has $itemName"
@@ -215,7 +219,8 @@ function New-OctopusIdList
         return $IdList
     }
 
-    $itemFilter = Read-Host -prompt "$itemName records found.  Please enter a comma-separated list of $itemName you'd like to associate the account to.  If left blank the account can be used for all $itemName."        
+    Write-OctopusVerbose "$itemName records found."
+    $itemFilter = Get-ParameterValue  -originalParameterValue $itemParameter -parameterName "a comma-separated list of $itemName you'd like to associate the account to.  If left blank the account can be used for all $itemName."        
     
     if ([string]::IsNullOrWhiteSpace($itemFilter) -eq $true)
     {
@@ -283,8 +288,8 @@ else
 {
     Write-OctopusWarning "The account $OctopusAccountName does not exist.  After creating the Azure Account it will create a new account in Octopus Deploy"
     Write-OctopusVerbose "Octopus accounts can be locked down to specific environments, tenants and tenant tags"
-    $OctopusEnvironmentIdList = New-OctopusIdList -OctopusUrl $OctopusURL -OctopusApiKey $OctopusApiKey -spaceInfo $spaceInfo -endPoint "environments" -itemName "environments"
-    $OctopusTenantIdList = New-OctopusIdList -OctopusUrl $OctopusURL -OctopusApiKey $OctopusApiKey -spaceInfo $spaceInfo -endPoint "tenants" -itemName "tenants"    
+    $OctopusEnvironmentIdList = New-OctopusIdList -OctopusUrl $OctopusURL -OctopusApiKey $OctopusApiKey -spaceInfo $spaceInfo -endPoint "environments" -itemName "environments" -itemParameter $OctopusEnvironmentList
+    $OctopusTenantIdList = New-OctopusIdList -OctopusUrl $OctopusURL -OctopusApiKey $OctopusApiKey -spaceInfo $spaceInfo -endPoint "tenants" -itemName "tenants" -itemParameter $OctopusTenantList
 }
 
 if ($OctopusAndAzureServicePrincipalAlreadyExist -eq $true)
@@ -305,11 +310,11 @@ Write-OctopusVerbose "Logging into Azure"
 Connect-AzAccount -Tenant $AzureTenantId -Subscription $AzureSubscriptionName
 
 Write-OctopusVerbose "Auto-generating new password"
-$AzureServicePrincipalEndDays = Get-ParameterValue -originalParameterValue $null -parameterName "the number of days you want the service principal password to be active"
+$AzureServicePrincipalPasswordEndDays = Get-ParameterValue -originalParameterValue $AzureServicePrincipalPasswordEndDays -parameterName "the number of days you want the service principal password to be active"
 $password = "$(New-Guid)$(New-Guid)" -replace "-", ""
 $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
 
-$endDate = (Get-Date).AddDays($AzureServicePrincipalEndDays)
+$endDate = (Get-Date).AddDays($AzureServicePrincipalPasswordEndDays)
 
 $azureSubscription = Get-AzSubscription -SubscriptionName $AzureSubscriptionName
 $azureSubscription | Format-Table
