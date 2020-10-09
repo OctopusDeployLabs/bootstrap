@@ -15,7 +15,12 @@ param (
     $AzureSQLResourceGroupName,
     $AzureSQLServerName,
     $AzureServicePrincpalId,
-    $AzureServicePrincpalSecretKey
+    $AzureServicePrincpalSecretKey,
+    $AzureContainerResourceGroupName,
+    $AzureContainerGroupName,
+    $DockerImageToUse,
+    $DockerCPUCount,
+    $DockerMemoryInGB
 )
 
 $ErrorActionPreference = "Stop"
@@ -254,11 +259,11 @@ function Set-AzureSubnet
         $subnetNameToUse = $null
         if ($subnetsAlreadyRegisteredForContainerGroups.Length -gt 0)
         {
-            $subnetNameToUse = Read-Host "The following subnets already are registered for Azure Container Services, please enter the name of the one you want to pick $subnetsAlreadyRegisteredForContainerGroups"            
+            $subnetNameToUse = Read-Host "The following subnets already are registered for Azure Container Services, please enter the name of the one you want to pick.  If you leave this blank you will be prompted to create a new subnet. Existing subnets to pick: $subnetsAlreadyRegisteredForContainerGroups"            
         }
         elseif ($subnetsThatQualifyForAzureServiceContainer.Length -gt 0)
         {
-            $subnetNameToUse = Read-Host "You don't have any subnets that already are registered for Azure Container Services, but these do not have any IP addresses associated with them.  Please enter the name of the one you want to pick.  $subnetsThatQualifyForAzureServiceContainer"
+            $subnetNameToUse = Read-Host "You don't have any subnets that already are registered for Azure Container Services, but these do not have any IP addresses associated with them.  Please enter the name of the one you want to pick.  If you leave this blank you will be prompted to create a new subnet.  Existing subnets to pick: $subnetsThatQualifyForAzureServiceContainer"
         }
 
         if ([string]::IsNullOrWhiteSpace($subnetNameToUse) -eq $false)
@@ -298,7 +303,7 @@ function Set-AzureSubnet
         }
                     
         Write-OctopusVerbose "Updating the subnet now."
-        Set-AzVirtualNetwork $existingNetwork
+        Set-AzVirtualNetwork -VirtualNetwork $existingNetwork
 
         return $subnetToUpdate.Name
     }
@@ -311,15 +316,14 @@ function Set-AzureSubnet
         exit
     }
 
-    $subnetName = Get-ParameterValue -originalParameterValue $null -parameterName "the name of the NEW subnet from connect the Azure Service Container to"
     $AzureNetworkSubnetAddressPrefix = Get-ParameterValue -originalParameterValue $AzureNetworkSubnetAddressPrefix -parameterName "the address prefix for the new subnet.  Must be a viable subnet in $($existingNetwork.AddressSpaceText)"
 
-    $delegation = New-AzDelegation -Name "ACIDelegationService" -ServiceName "Microsoft.ContainerInstance/containerGroups"
-    $newSubnet = New-AzVirtualNetworkSubnetConfig -Name $AzureNetworkSubnetName -AddressPrefix $AzureNetworkSubnetAddressPrefix -Delegation = @($delegation) -ServiceEndpoint = "Microsoft.Sql"
+    $delegation = New-AzDelegation -Name "$AzureNetworkSubnetName-ACIDelegationService" -ServiceName "Microsoft.ContainerInstance/containerGroups"
+    $newSubnet = New-AzVirtualNetworkSubnetConfig -Name $AzureNetworkSubnetName -AddressPrefix $AzureNetworkSubnetAddressPrefix -Delegation @($delegation) -ServiceEndpoint "Microsoft.Sql"
     $existingNetwork.Subnets.Add($newSubnet)
-    Set-AzVirtualNetwork $existingNetwork
+    Set-AzVirtualNetwork -VirtualNetwork $existingNetwork
 
-    return $subnetName
+    return $AzureNetworkSubnetName
 }
 
 
@@ -375,7 +379,7 @@ Connect-ToAzureAccount -AzureTenantId $AzureTenantId -AzureSubscriptionName $Azu
 
 $AzureNetworkName = Get-ParameterValue -originalParameterValue $AzureNetworkName -parameterName "the name of the virtual network to attach the container to"
 $AzureNetworkResourceGroupName = Get-ParameterValue -originalParameterValue $AzureNetworkResourceGroupName -parameterName "the name of the resource group the virtual network should live in"
-
+$LocationToUse = $AzureNetworkResourceGroupLocation
 try{
     Write-OctopusVerbose "Checking to see if the network resource group $AzureNetworkResourceGroupName exists"
     $networkResourceGroup = Get-AzResourceGroup -Name $AzureNetworkResourceGroupName    
@@ -390,6 +394,7 @@ catch
         Get-AzLocation | Format-Table
         $AzureNetworkResourceGroupLocation = Get-ParameterValue -originalParameterValue $AzureNetworkResourceGroupLocation -parameterName "the location of the resource group for the virtual network.  Examples include centralus, northcentralus, australiaeast, etc.  See above for full list."
     
+        $LocationToUse = $AzureNetworkResourceGroupLocation
         New-AzResourceGroup -Name $AzureNetworkResourceGroupName -Location $AzureNetworkResourceGroupLocation
     }    
 }
@@ -405,9 +410,7 @@ catch
     if ($createVirtualNetwork)
     {
         Write-OctopusVerbose "Creating the virtual network '$AzureNetworkName'"        
-        $AzureNetworkAddressSpace = Get-ParameterValue -originalParameterValue $AzureNetworkAddressSpace -parameterName "the IP address prefix.  Typically it is 172.19.0.0/16 or 10.0.0.0/16 or 192.168.0.0/16."
-    
-        $LocationToUse = $AzureNetworkResourceGroupLocation
+        $AzureNetworkAddressSpace = Get-ParameterValue -originalParameterValue $AzureNetworkAddressSpace -parameterName "the IP address prefix.  Typically it is 172.19.0.0/16 or 10.0.0.0/16 or 192.168.0.0/16."        
 
         if ($null -eq $LocationToUse)
         {
@@ -448,5 +451,70 @@ foreach ($virtualNetworkRule in $virtualNetworkRuleList)
 
 if ($alreadyConnected -eq $false)
 {
+    Write-OctopusVerbose "Adding the subnet to the Azure SQL Server Firewall"
     New-AzSqlServerVirtualNetworkRule -ResourceGroupName $AzureSQLResourceGroupName -ServerName $AzureSQLServerName -VirtualNetworkRuleName "$AzureNetworkName-$subnetToUse" -VirtualNetworkSubnetId $azureSubnet.Id
+    Write-OctopusSuccess "Successfully added $subnetToUse to the firewall for Azure SQL Server $AzureSQLServerName in the resource group $AzureSQLResourceGroupName"
 }
+
+Write-OctopusVerbose "Okay...finally.  The worker pools exists in Octopus Deploy, the subnet exists and can connect to Azure SQL.  Time to create the docker container."
+
+$AzureContainerResourceGroupName = Get-ParameterValue -originalParameterValue $AzureContainerResourceGroupName -parameterName "the resource group the Azure Container will live in"
+
+try{
+    Write-OctopusVerbose "Checking to see if the container resource group $AzureContainerResourceGroupName exists"
+    $containerResourceGroup = Get-AzResourceGroup -Name $AzureContainerResourceGroupName    
+    Write-OctopusVerbose "$AzureContainerResourceGroupName exists moving on"
+}
+catch
+{
+    $createContainerResourceGroup = Get-UserAnswer -ItemName "Azure Resource Group '$AzureContainerResourceGroupName'" -TestCondition $($null -eq $containerResourceGroup)
+    if ($createContainerResourceGroup)
+    {
+        Write-OctopusVerbose "Creating the resource group $AzureContainerResourceGroupName Azure Container."
+        
+        $LocationToUse = $AzureNetworkResourceGroupLocation
+
+        if ($null -eq $LocationToUse)
+        {
+            Write-OctopusVerbose "Now we need to know where this virtual network will live.  Listing out all the locations."
+            Get-AzLocation | Format-Table
+            $AzureNetworkLocation = Get-ParameterValue -originalParameterValue $AzureNetworkLocation -parameterName "the location of the container resource group.  Examples include centralus, northcentralus, australiaeast, etc.  See above for full list."
+
+            $LocationToUse = $AzureNetworkLocation
+        }                
+    
+        New-AzResourceGroup -Name $AzureContainerResourceGroupName -Location $LocationToUse
+    }    
+}
+
+$AzureContainerGroupName = Get-ParameterValue -originalParameterValue $AzureContainerGroupName -parameterName "the name of the Azure Container Group."
+
+$existingContainers = Get-AzContainerGroup -ResourceGroupName $AzureContainerResourceGroupName
+
+foreach ($container in $existingContainers)
+{
+    if ($container.Name -eq $AzureContainerGroupName)
+    {        
+        Write-OctopusVerbose "The container already exists, deleting it so it can be updated."
+        Remove-AzContainerGroup -ResourceGroupName $AzureContainerResourceGroupName -Name $AzureContainerGroupName
+    }
+}
+
+$DockerImageToUse = Get-ParameterValueWithDefault -originalParameterValue $DockerImageToUse -parameterName "docker hub image to use. The default is octopuslabs/tentacle-worker.  Leave blank for default" -defaultValue "octopuslabs/tentacle-worker"
+$DockerCPUCount = Get-ParameterValueWithDefault -originalParameterValue $DockerCPUCount -parameterName "the number of CPUs to associate to the container.  Default is 1.  Leave blank for default" -defaultValue "1"
+$DockerMemoryInGB = Get-ParameterValueWithDefault -originalParameterValue $DockerMemoryInGB -parameterName "the amount of memory (in GB) to associate to the container.  Default is 1.5.  Leave blank for default" -defaultValue "1.5"
+
+$environmentVariables = @{
+    SERVER_URL="$OctopusURL"
+    SERVER_API_KEY="$OctopusApiKey"
+    REGISTRATION_NAME="$AzureContainerGroupName" 
+    TARGET_WORKER_POOL="$OctopusWorkerPoolName" 
+    SPACE="$OctopusSpaceName" 
+    ACCEPT_EULA="Y"
+}
+
+$containerNicConfigIpConfig = New-AzContainerNicConfigIpConfig -Name "$AzureContainerGroupName-ip" -subnet $azureSubnet -SubnetId $azureSubnet.Id
+$containerNicConfig = New-AzContainerNicConfig -Name "$AzureContainerGroupName-nic" -IpConfiguration $containerNicConfigIpConfig
+$networkProfile = New-AzNetworkProfile -Name "$AzureContainerGroupName-profile" -Location $LocationToUse -ResourceGroupName $AzureContainerResourceGroupName -ContainerNetworkInterfaceConfiguration $containerNicConfig
+Write-OctopusVerbose "Creating the Azure Container.  This might freeze the screen while everything is setup in Azure."
+$container = New-AzContainerGroup -ResourceGroupName $AzureContainerResourceGroupName -Name $AzureContainerGroupName -Location $LocationToUse -Image $DockerImageToUse -OsType "Linux" -Cpu $DockerCPUCount -MemoryInGB $DockerMemoryInGB -EnvironmentVariable $environmentVariables -NetworkProfile $networkProfile
