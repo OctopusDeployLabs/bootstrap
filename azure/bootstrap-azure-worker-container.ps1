@@ -13,7 +13,9 @@ param (
     $AzureNetworkAddressSpace,
     $AzureNetworkSubnetAddressPrefix,
     $AzureSQLResourceGroupName,
-    $AzureSQLServerName
+    $AzureSQLServerName,
+    $AzureServicePrincpalId,
+    $AzureServicePrincpalSecretKey
 )
 
 $ErrorActionPreference = "Stop"
@@ -72,6 +74,31 @@ function Get-ParameterValueWithDefault
     }
 
     return $returnValue
+}
+
+function Connect-ToAzureAccount
+{
+    param
+    (
+        $AzureTenantId,
+        $AzureSubscriptionName,
+        $AzureServicePrincpalId,
+        $AzureServicePrincpalSecretKey
+    )
+
+    if ([string]::IsNullOrWhiteSpace($AzureServicePrincpalId) -eq $false)
+    {
+        Write-OctopusVerbose "Logging into Azure using the supplied service principal"        
+        $securePassword = ConvertTo-SecureString $AzureServicePrincpalSecretKey -AsPlainText -Force
+        $azureCredential = New-Object System.Management.Automation.PSCredential ($AzureServicePrincpalId, $securePassword)
+        Connect-AzAccount -Tenant $AzureTenantId -Subscription $AzureSubscriptionName -ServicePrincipal -Credential $azureCredential 
+
+    }
+    else 
+    {
+        Write-OctopusVerbose "Logging into Azure"
+        Connect-AzAccount -Tenant $AzureTenantId -Subscription $AzureSubscriptionName     
+    }
 }
 
 function Invoke-OctopusApi
@@ -188,7 +215,8 @@ function Set-AzureSubnet
     param (
         $existingNetwork,
         $AzureNetworkSubnetName,
-        $AzureNetworkSubnetAddressPrefix
+        $AzureNetworkSubnetAddressPrefix,
+        $AzureNetworkLocation
     )
 
     Write-OctopusVerbose "Pulling all the subnets of the virtual network"
@@ -196,98 +224,86 @@ function Set-AzureSubnet
     $subnetsThatQualifyForAzureServiceContainer = @()
     $subnetsAlreadyRegisteredForContainerGroups = @()
     $AzureNetworkSubnetName = Get-ParameterValue -originalParameterValue $AzureNetworkSubnetName -parameterName "the name of the subnet to connect the Azure Service Container to"
-    $desiredSubnetExists = $false
-    $desiredSubnetRegisteredForAzureServiceContainerGroups = $false
-    $desiredSubnetHasIpsAllocated = $false
+    $subnetToUpdate = $existingSubnets | Where-Object {$_.Name -eq $AzureNetworkSubnetName}    
+    
+    if ($null -eq $subnetToUpdate)
+    {
+        Write-Host "The subnet $AzureNetworkSubnetName was not found."
 
-    foreach ($subnet in $existingSubnets)
-    {       
-        $isRegisteredToContainerGroups = $false
-        if ($subnet.Name -eq $AzureNetworkSubnetName)
-        {
-            Write-OctopusVerbose "Found the subnet $AzureNetworkSubnetName"
-            $desiredSubnetExists = $true
-        }
-
-        foreach ($delegation in $subnet.Delegations)
-        {
-            if ($delegation.ServiceName -eq "Microsoft.ContainerInstance/containerGroups")
+        foreach ($subnet in $existingSubnets)
+        {               
+            $isRegisteredToContainerGroups = $false
+            foreach ($delegation in $subnet.Delegations)
             {
-                $isRegisteredToContainerGroups = $true
+                if ($delegation.ServiceName -eq "Microsoft.ContainerInstance/containerGroups")
+                {
+                    $subnetsAlreadyRegisteredForContainerGroups += $subnet.Name                    
+                    $isRegisteredToContainerGroups = $true
+                    
+                    break
+                }
+            }            
 
-                if ($subnet.Name -eq $AzureNetworkSubnetName)
-                {
-                    $desiredSubnetRegisteredForAzureServiceContainerGroups = $true
-                }
-                else
-                {
-                    $subnetsAlreadyRegisteredForContainerGroups += $subnet.Name    
-                }
-                
-                break
+            if ($isRegisteredToContainerGroups -eq $false -and $subnet.IpConfigurations.Count -eq 0)
+            {
+                $subnetsThatQualifyForAzureServiceContainer += $subnet.Name
             }
-        }    
+        }
 
-        $desiredSubnetHasIpsAllocated = $($subnet.IpConfigurations.Count -eq 0)
-
-        if ($isRegisteredToContainerGroups -eq $false -and $subnet.IpConfigurations.Count -eq 0)
+        
+        $subnetNameToUse = $null
+        if ($subnetsAlreadyRegisteredForContainerGroups.Length -gt 0)
         {
-            $subnetsThatQualifyForAzureServiceContainer += $subnet.Name
+            $subnetNameToUse = Read-Host "The following subnets already are registered for Azure Container Services, please enter the name of the one you want to pick $subnetsAlreadyRegisteredForContainerGroups"            
+        }
+        elseif ($subnetsThatQualifyForAzureServiceContainer.Length -gt 0)
+        {
+            $subnetNameToUse = Read-Host "You don't have any subnets that already are registered for Azure Container Services, but these do not have any IP addresses associated with them.  Please enter the name of the one you want to pick.  $subnetsThatQualifyForAzureServiceContainer"
+        }
+
+        if ([string]::IsNullOrWhiteSpace($subnetNameToUse) -eq $false)
+        {
+            $subnetToUpdate = $existingSubnets | Where-Object {$_.Name -eq $subnetNameToUse}
         }
     }
 
-    if ($desiredSubnetExists -eq $true -and $desiredSubnetRegisteredForAzureServiceContainerGroups -eq $true)
+    if ($null -ne $subnetToUpdate)
     {
-        Write-OctopusVerbose "Found the subnet specified.  It is already configured to host Azure Containers.  Moving on."
-        return $AzureNetworkSubnetName
-    }
-    elseif ($desiredSubnetExists -eq $true -and $desiredSubnetRegisteredForAzureServiceContainerGroups -eq $false -and $desiredSubnetHasIpsAllocated -eq $false)
-    {
-        $updateExistingSubnet = Read-Host -Prompt "The subnet specified exists, but it is not configured to host Azure Containers.  It doesn't have anything connected to it.  Do you wish to update it to host Azure Containers?  WARNING: this means this subnet can only have Azure Containers connect to it!  Proceed with update? y/n"
-        if ($updateExistingSubnet.ToLower() -eq "y")
+        $containerRegistration = @($subnetToUpdate.Delegations | Where-Object {$_.ServiceName -eq "Microsoft.ContainerInstance/containerGroups"})
+        $serviceRegistration = @($subnetToUpdate.ServiceEndpoints | Where-Object {$_.Service -eq "Microsoft.Sql" })
+
+        if ($containerRegistration.Count -gt 0 -and $serviceRegistration.Count -gt 0)
         {
-            New-AzureSubnetDelegation -existingNetwork $existingNetwork -subnetName $AzureNetworkSubnetName
-            return $AzureNetworkSubnetName
-        }    
-    }
-    elseif ($desiredSubnetExists -eq $true -and $desiredSubnetRegisteredForAzureServiceContainerGroups -eq $false -and $desiredSubnetHasIpsAllocated -eq $true)
-    {
-        $continueWithScript = Read-Host -Prompt "The subnet specified exists, but it not configured to host Azure Containers and it cannot be updated to do so since it already has IPs allocated.  Do you wish to continue?  The script will prompt you to update an existing subnet, pick a subnet which is already configured, or create a new one.  Selecting n will stop the script.  y/n"
-        if ($continueWithScript.ToLower() -ne "y")
-        {
-            Write-OctopusWarning "You elected to not continue.  Stopping script."
-            exit
+            Write-OctopusSuccess "Found the subnet specified.  It is already configured to host Azure Containers and connect to Azure SQL.  Moving on."
+            return $subnetToUpdate.Name
         }
-    }
 
-    if ($subnetsAlreadyRegisteredForContainerGroups.Length -gt 0)
-    {
-        Write-OctopusVerbose "The subnet specified couldn't be found or it isn't configured properly.  The following subnets are configured to allow Azure Containers to connect to them."
-        Write-OctopusVerbose $subnetsAlreadyRegisteredForContainerGroups
-        $subnetName = Get-ParameterValue -originalParameterValue $null -parameterName "the name of the subnet from that list to connect the Azure Service Container to.  Leaving blank will prompt you to create or update an existing subnet."
-
-        if ([string]::IsNullOrWhiteSpace($subnetName) -eq $false)
+        Write-OctopusVerbose "The subnet specified exists.  Checking to see if needs to be updated"
+        if ($containerRegistration.Count -eq 0)
         {
-            Write-OctopusVerbose "Okay, will use $AzureNetworkSubnetName going forward."
-            return $subnetName    
+            Write-OctopusVerbose "The subnet is not registered to allow Azure Continers to connect to it.  Adding that delegation."
+            $delegationToAdd = New-AzDelegation -ServiceName "Microsoft.ContainerInstance/containerGroups" -Name "ACIDelegationService"
+            $subnetToUpdate.Delegations.Add($delegationToAdd)
         }
-    }
 
-    if ($subnetsThatQualifyForAzureServiceContainer.Length -gt 0)
-    {
-        Write-OctopusVerbose "The subnet specified couldn't be found or it isn't configured properly.  The following subnets are NOT configured to allow Azure Containers to connect to them but have no IP Addresses allocated to them."
-        Write-OctopusVerbose $subnetsAlreadyRegisteredForContainerGroups
-        $subnetName = Get-ParameterValue -originalParameterValue $null -parameterName "the name of the subnet from that list to connect the Azure Service Container to.  Leaving blank will prompt you to create a new subnet.  Warning! This will update the existing subnet to only allow Azure Containers to connect to it."
-
-        if ([string]::IsNullOrWhiteSpace($subnetName) -eq $false)
+        if ($serviceRegistration.Count -eq 0)
         {
-            Write-OctopusVerbose "Okay, will first try to update that existing subnet."
-            New-AzureSubnetDelegation -existingNetwork $existingNetwork -subnetName $subnetName
-            return $subnetName
+            Write-OctopusVerbose "The subnet is not configured to connect to Azure SQL via a service endpoint.  Adding that service endpoint."
+            $sqlDelegation = New-AzServiceEndpointPolicyDefinition -Name "$($subnetToUpdate.Name)-AzureSQL" -Service "Microsoft.SQL"
+            
+            # Service Endpoint Policy
+            $sep = New-AzServiceEndpointPolicy -ResourceGroupName $rgName -Name "$($subnetToUpdate.Name)-AzureSQL" -Location $AzureNetworkLocation -ServiceEndpointPolicyDefinition $sqlDelegation
+            
+            $subnetToUpdate.ServiceEndpoints.Add($sep)
         }
+                    
+        Write-OctopusVerbose "Updating the subnet now."
+        Set-AzVirtualNetwork $existingNetwork
+
+        return $subnetToUpdate.Name
     }
 
-    Write-OctopusVerbose "Couldn't find a subnet to attach the Azure Service Container to AND all existing subnets are being used."
+    Write-OctopusVerbose "Okay, going to create a new subnet because the script couldn't find one that qualifies."
     $continueWithScript = Read-Host "Do you wish to continue and create a new subnet? Answering n will stop the script y/n"
     if ($continueWithScript.ToLower() -ne "y")
     {
@@ -299,25 +315,13 @@ function Set-AzureSubnet
     $AzureNetworkSubnetAddressPrefix = Get-ParameterValue -originalParameterValue $AzureNetworkSubnetAddressPrefix -parameterName "the address prefix for the new subnet.  Must be a viable subnet in $($existingNetwork.AddressSpaceText)"
 
     $delegation = New-AzDelegation -Name "ACIDelegationService" -ServiceName "Microsoft.ContainerInstance/containerGroups"
-    $newSubnet = New-AzVirtualNetworkSubnetConfig -Name $AzureNetworkSubnetName -AddressPrefix $AzureNetworkSubnetAddressPrefix -Delegation = @($delegation)
+    $newSubnet = New-AzVirtualNetworkSubnetConfig -Name $AzureNetworkSubnetName -AddressPrefix $AzureNetworkSubnetAddressPrefix -Delegation = @($delegation) -ServiceEndpoint = "Microsoft.Sql"
     $existingNetwork.Subnets.Add($newSubnet)
     Set-AzVirtualNetwork $existingNetwork
 
     return $subnetName
 }
 
-function New-AzureSubnetDelegation
-{
-    param (
-        $existingNetwork,
-        $subnetName
-    )
-
-    $delegationToAdd = New-AzDelegation -ServiceName "Microsoft.ContainerInstance/containerGroups" -Name "ACIDelegationService"
-    $subnet = Get-AzVirtualNetworkSubnetConfig -Name $subnetName -VirtualNetwork $existingNetwork
-    $subnet.Delegations.Add($delegationToAdd)
-    Set-AzVirtualNetwork $existingNetwork
-}
 
 Write-OctopusVerbose "This script will create an Octopus Deploy Worker as an Azure Service Container.  It will do that by doing the following:"
 Write-OctopusVerbose "    1) Octopus Deploy: Verify worker pool (https://octopus.com/docs/infrastructure/workers) exists.  If not it will create it."
@@ -367,8 +371,7 @@ Write-OctopusVerbose "Octopus Deploy is all ready to go.  Moving onto Azure."
 $AzureTenantId = Get-ParameterValue -originalParameterValue $AzureTenantId -parameterName "the ID (GUID) of the Azure tenant you wish to connect to.  See https://microsoft.github.io/AzureTipsAndTricks/blog/tip153.html on how to get that id"
 $AzureSubscriptionName = Get-ParameterValue -originalParameterValue $AzureSubscriptionName -parameterName "the name of the subscription you wish to connect Octopus Deploy to"
 
-Write-OctopusVerbose "Logging into Azure"
-Connect-AzAccount -Tenant $AzureTenantId -Subscription $AzureSubscriptionName 
+Connect-ToAzureAccount -AzureTenantId $AzureTenantId -AzureSubscriptionName $AzureSubscriptionName -AzureServicePrincpalId $AzureServicePrincpalId -AzureServicePrincpalSecretKey $AzureServicePrincpalSecretKey
 
 $AzureNetworkName = Get-ParameterValue -originalParameterValue $AzureNetworkName -parameterName "the name of the virtual network to attach the container to"
 $AzureNetworkResourceGroupName = Get-ParameterValue -originalParameterValue $AzureNetworkResourceGroupName -parameterName "the name of the resource group the virtual network should live in"
@@ -420,6 +423,30 @@ catch
 }
 
 $existingNetwork = Get-AzVirtualNetwork -Name $AzureNetworkName -ResourceGroupName $AzureNetworkResourceGroupName
-$subnetToUse = Set-AzureSubnet -existingNetwork $existingNetwork -AzureNetworkSubnetName $AzureNetworkSubnetName -AzureNetworkSubnetAddressPrefix $AzureNetworkSubnetAddressPrefix
+$subnetToUse = Set-AzureSubnet -existingNetwork $existingNetwork -AzureNetworkSubnetName $AzureNetworkSubnetName -AzureNetworkSubnetAddressPrefix $AzureNetworkSubnetAddressPrefix -AzureNetworkLocation $AzureNetworkLocation
 
 $existingSubnets = Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $existingNetwork
+$azureSubnet = $existingSubnets | Where-Object {$_.Name -eq $subnetToUse}
+
+Write-OctopusVerbose "Now checking to see if the Azure SQL Server Firewall allows connections from $subnetToUse"
+$AzureSQLResourceGroupName = Get-ParameterValue -originalParameterValue $AzureSQLResourceGroupName -parameterName "the resource group your Azure SQL Server instance is assigned to"
+$AzureSQLServerName = Get-ParameterValue -originalParameterValue $AzureSQLServerName -parameterName "the name of your Azure SQL Server"
+
+Write-OctopusVerbose "Getting the virtual network rules for the Azure SQL Server $AzureSQLServerName in the resource group $AzureSQLResourceGroupName"
+$virtualNetworkRuleList = Get-AzSqlServerVirtualNetworkRule -ResourceGroupName $AzureSQLResourceGroupName -ServerName $AzureSQLServerName
+
+$alreadyConnected = $false
+foreach ($virtualNetworkRule in $virtualNetworkRuleList)
+{    
+    if ($azureSubnet.Id -eq $virtualNetworkRule.VirtualNetworkSubnetId)
+    {
+        $alreadyConnected = $true
+        Write-OctopusSuccess "The virtual network subnet is already connected to the Azure SQL Server Instance"
+        break
+    }
+}
+
+if ($alreadyConnected -eq $false)
+{
+    New-AzSqlServerVirtualNetworkRule -ResourceGroupName $AzureSQLResourceGroupName -ServerName $AzureSQLServerName -VirtualNetworkRuleName "$AzureNetworkName-$subnetToUse" -VirtualNetworkSubnetId $azureSubnet.Id
+}
